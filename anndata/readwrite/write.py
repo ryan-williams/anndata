@@ -4,12 +4,22 @@ from pathlib import Path
 import pandas as pd
 import math
 import numpy as np
-from scipy.sparse import issparse
+from scipy import sparse
 import logging as logg
+import zarr
 
 from ..base import AnnData
 from .. import h5py
 from ..compat import PathLike, fspath
+
+
+def issparse(value):
+    return \
+        sparse.issparse(value) or \
+        (
+                hasattr(value, 'format_str') and
+                value.format_str == 'csr'
+        )
 
 
 def write_csvs(dirname: PathLike, adata: AnnData, skip_data: bool = True, sep: str = ','):
@@ -82,9 +92,9 @@ def write_loom(filename: PathLike, adata: AnnData):
 # TODO: store can be a MutableMapping or a string - accept PathLike too?
 def write_zarr(store, adata: AnnData, **kwargs):
     d = adata._to_dict_fixed_width_arrays()
-    import zarr
     f = zarr.open(store, mode='w')
     for key, value in d.items():
+        print('writing: %s -> %s (%s… sparse? %s)' % (key, value, *kwargs, issparse(value)))
         _write_key_value_to_zarr(f, key, value, **kwargs)
 
 def _write_key_value_to_zarr(f, key, value, **kwargs):
@@ -109,8 +119,10 @@ def _write_key_value_to_zarr(f, key, value, **kwargs):
         else:
             # make sure value is an array
             value = np.array(value)
+
             # hm, why that?
             if value.ndim == 0: value = np.array([value])
+
         # make sure string format is chosen correctly
         if value.dtype.kind == 'U': value = value.astype(np.string_)
         return value
@@ -133,12 +145,22 @@ def _write_key_value_to_zarr(f, key, value, **kwargs):
                 return
             else:
                 del f[key]
-        #f.create_dataset(key, data=value, **kwargs)
+
         if key != 'X': # TODO: make this more explicit
             del kwargs['chunks']
         import numcodecs # TODO: only set object_codec for objects
-        ds = f.create_dataset(key, shape=value.shape,
-                                 dtype=value.dtype, object_codec=numcodecs.JSON(), **kwargs)
+
+        print('creating dataset %s (%s): shape %s, chunks %s' % (key, value, value.shape, kwargs['chunks'] if hasattr(kwargs, 'chunks') else ''))
+
+        ds = \
+            f.create_dataset(
+                key,
+                shape=value.shape,
+                dtype=value.dtype,
+                object_codec=numcodecs.JSON(),
+                **kwargs
+            )
+
         _write_in_zarr_chunks(ds, key, value)
     except TypeError:
         # try writing as byte strings
@@ -165,8 +187,7 @@ def _write_key_value_to_zarr(f, key, value, **kwargs):
                         return
                     else:
                         del f[key]
-                #f.create_dataset(
-                #    key, data=value.astype(new_dtype), **kwargs)
+
                 ds = f.create_dataset(key, shape=value.astype(new_dtype).shape,
                                       dtype=value.astype(new_dtype).dtype, **kwargs)
                 _write_in_zarr_chunks(ds, key, value.astype(new_dtype))

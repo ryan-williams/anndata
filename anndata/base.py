@@ -1936,13 +1936,14 @@ class AnnData(IndexMixin, metaclass=utils.DeprecationMixinMeta):
         obs_rec, uns_obs = df_to_records_fixed_width(self._obs)
         var_rec, uns_var = df_to_records_fixed_width(self._var)
         d = {
-            'X': self._X,
             'obs': obs_rec,
             'var': var_rec,
+            'X': self.X,
             'obsm': self._obsm,
             'varm': self._varm,
             # add the categories to the unstructured annotation
-            'uns': {**self._uns, **uns_obs, **uns_var}}
+            'uns': {**self._uns, **uns_obs, **uns_var}
+        }
 
         if self.raw is not None:
             # we ignore categorical data types here
