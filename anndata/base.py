@@ -576,8 +576,12 @@ class AnnData(IndexMixin, metaclass=utils.DeprecationMixinMeta):
     -----
     Multi-dimensional annotations are stored in ``.obsm`` and ``.varm``.
 
+    Indexing into an AnnData object with a numeric is supposed to be positional,
+    like pandas ``.iloc`` method, while indexing with a string/ categorical is
+    supposed to behave like ``.loc``.
+
     If the unstructured annotations ``.uns`` contain a sparse matrix of shape
-    ``.n_obs`` × ``.n_obs``, these are also sliced.
+    ``.n_obs`` × ``.n_obs``, these are sliced when upon calls of `.[]`.
 
     :class:`~anndata.AnnData` stores observations (samples) of variables
     (features) in the rows of a matrix. This is the convention of the modern
@@ -1817,11 +1821,46 @@ class AnnData(IndexMixin, metaclass=utils.DeprecationMixinMeta):
         from .readwrite.write import write_loom
         write_loom(filename, self)
 
-
     def write_zarr(self, store, chunks):
         from .readwrite.write import write_zarr
         write_zarr(store, self, chunks=chunks)
 
+    def chunked_X(self, chunk_size=None):
+        if chunk_size is None:
+            # Should be some adaptive code
+            chunk_size = 6000
+        start = 0
+        n = self.n_obs
+        for _ in range(int(n // chunk_size)):
+            end = start + chunk_size
+            yield (self.X[start:end], start, end)
+            start = end
+        if start < n:
+            yield (self.X[start:n], start, n)
+
+    def chunk_X(self, select=1000, replace=T):
+        # select is an integer or an array of indices for the batch
+        # if select is an integer, random batch of size=select will be returned
+        if isinstance(select, int):
+            select = select if select < self.n_obs else self.n_obs
+            choice = np.random.choice(self.n_obs, select, replace)
+        elif isinstance (select, (np.ndarray, list, tuple)):
+            choice = np.array(select)
+        else:
+            raise ValueError('select should be int or array')
+
+        reverse = None
+        if self.isbacked:
+            # h5py can only slice with a sorted list of unique index values
+            # so random batch with indices [2, 2, 5, 3, 8, 10, 8] will fail
+            # this fixes the problem
+            indices, reverse = np.unique(choice, return_inverse=True)
+            selection = self.X[indices.tolist()]
+        else:
+            selection = self.X[choice]
+
+        selection = selection.toarray() if issparse(selection) else selection
+        return selection if reverse is None else selection[reverse]
 
     @staticmethod
     def _from_dict(ddata):
@@ -1838,7 +1877,7 @@ class AnnData(IndexMixin, metaclass=utils.DeprecationMixinMeta):
         valid_keys = []
         for keys in AnnData._H5_ALIASES.values():
             valid_keys += keys
-        valid_keys += ['raw.X', 'raw.var', 'raw.varm']
+        valid_keys += ['raw.X', 'raw.var', 'raw.varm', 'raw.cat']
         for key in ddata.keys():
             # if there is another key then the prdedefined
             # then we are reading the old format
@@ -1913,13 +1952,23 @@ class AnnData(IndexMixin, metaclass=utils.DeprecationMixinMeta):
             # get the dataframe
             raw['var'] = pd.DataFrame.from_records(
                 ddata['raw.var'], index='index')
-
             del ddata['raw.var']
             raw['var'].index = raw['var'].index.astype('U')
             # transform to unicode string
             for c in raw['var'].columns:
                 if is_string_dtype(raw['var'][c]):
                     raw['var'][c] = Index(raw['var'][c]).astype('U').values
+            # these are the category fields
+            if 'raw.cat' in ddata:  # old h5ad didn't have that field
+                for k, v in ddata['raw.cat'].items():
+                    if k.endswith('_categories'):
+                        k_stripped = k.replace('_categories', '')
+                        if isinstance(v, (str, int)):  # fix categories with a single category
+                            v = [v]
+                        raw['var'][k_stripped] = pd.Categorical.from_codes(
+                            codes=raw['var'][k_stripped].values,
+                            categories=v)
+                del ddata['raw.cat']
         if 'raw.varm' in ddata:
             raw['varm'] = ddata['raw.varm']
             del ddata['raw.varm']
@@ -1950,14 +1999,11 @@ class AnnData(IndexMixin, metaclass=utils.DeprecationMixinMeta):
         }
 
         if self.raw is not None:
-            # we ignore categorical data types here
-            # they should never occur
             var_rec, uns_var = df_to_records_fixed_width(self.raw._var)
-            if len(uns_var) > 0:
-                warnings.warn('Categorical dtypes in `.raw.var` are cast to integer.')
             d['raw.X'] = self.raw.X
             d['raw.var'] = var_rec
             d['raw.varm'] = self.raw.varm
+            d['raw.cat'] = uns_var
 
         return d
 
@@ -2075,16 +2121,3 @@ class AnnData(IndexMixin, metaclass=utils.DeprecationMixinMeta):
         values = getattr(self, a)[keys].values
         getattr(self, a).drop(keys, axis=1, inplace=True)
         return values
-
-    def chunked_X(self, chunk_size=None):
-        if chunk_size is None:
-            # Should be some adaptive code
-            chunk_size = 6000
-        start = 0
-        n = self.n_obs
-        for _ in range(int(n // chunk_size)):
-            end = start + chunk_size
-            yield (self.X[start:end], start, end)
-            start = end
-        if start < n:
-            yield (self.X[start:n], start, n)
